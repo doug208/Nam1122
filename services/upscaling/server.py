@@ -20,6 +20,18 @@ import numpy as np
 from spandrel import ModelLoader, ImageModelDescriptor
 import urllib.request
 import shutil
+# Configuration for content-aware pre-processing
+NOISE_THRESHOLD = 100  # Laplacian variance below this indicates noisy input
+SHARPNESS_THRESHOLD = 500  # Laplacian variance above this indicates sharp input
+MAX_SAMPLE_FRAMES = 10  # Maximum frames to sample for analysis
+DENOISE_LUMA_SPATIAL = 2  # hqdn3d luma spatial strength (light denoising)
+DENOISE_CHROMA_SPATIAL = 1  # hqdn3d chroma spatial strength
+DENOISE_LUMA_TEMPORAL = 2  # hqdn3d luma temporal strength
+DENOISE_CHROMA_TEMPORAL = 1  # hqdn3d chroma temporal strength
+
+# Configuration for sharpness reduction
+SHARPNESS_REDUCTION_KERNEL_SIZE = 3  # Gaussian blur kernel size for sharpness reduction
+SHARPNESS_REDUCTION_SIGMA = 0.5  # Gaussian blur sigma for sharpness reduction
 
 app = FastAPI()
 
@@ -72,6 +84,147 @@ def get_hat_model_path(scale_factor: str) -> Path:
         print(f"Using cached HAT-L {scale_factor}x weights from {model_path}")
     
     return model_path
+
+
+def detect_noise_and_sharpness(video_path: Path, sample_count: int = MAX_SAMPLE_FRAMES) -> tuple[float, float]:
+    """
+    Detect noise and sharpness levels in a video using variance-of-Laplacian.
+    
+    Args:
+        video_path: Path to the video file
+        sample_count: Number of frames to sample for analysis
+        
+    Returns:
+        tuple: (noise_score, sharpness_score) where:
+            - noise_score: Average Laplacian variance (lower = more noise)
+            - sharpness_score: Average Laplacian variance (higher = sharper)
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return 0.0, 0.0
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        return 0.0, 0.0
+    
+    # Sample frames evenly distributed throughout the video
+    sample_indices = []
+    if total_frames <= sample_count:
+        sample_indices = list(range(total_frames))
+    else:
+        step = total_frames / sample_count
+        sample_indices = [int(i * step) for i in range(sample_count)]
+    
+    laplacian_variances = []
+    
+    for frame_idx in sample_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        
+        # Convert to grayscale for Laplacian analysis
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate Laplacian variance (measure of sharpness/noise)
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        variance = laplacian.var()
+        laplacian_variances.append(variance)
+    
+    cap.release()
+    
+    if not laplacian_variances:
+        return 0.0, 0.0
+    
+    avg_variance = sum(laplacian_variances) / len(laplacian_variances)
+    
+    # Noise score: lower variance indicates more noise
+    # Sharpness score: higher variance indicates sharper image
+    return avg_variance, avg_variance
+
+
+def apply_denoising(input_path: Path, output_path: Path) -> bool:
+    """
+    Apply light denoising using FFmpeg hqdn3d filter.
+    
+    Args:
+        input_path: Path to input video
+        output_path: Path to output denoised video
+        
+    Returns:
+        bool: True if denoising succeeded, False otherwise
+    """
+    denoise_cmd = [
+        "ffmpeg",
+        "-i", str(input_path),
+        "-vf", f"hqdn3d={DENOISE_LUMA_SPATIAL}:{DENOISE_CHROMA_SPATIAL}:{DENOISE_LUMA_TEMPORAL}:{DENOISE_CHROMA_TEMPORAL}",
+        "-c:v", "libx264",
+        "-crf", "23",  # Slightly higher quality for denoised output
+        "-preset", "fast",
+        "-c:a", "copy",  # Copy audio without re-encoding
+        "-y",
+        str(output_path)
+    ]
+    
+    try:
+        result = subprocess.run(
+            denoise_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300
+        )
+        return result.returncode == 0 and output_path.exists()
+    except subprocess.TimeoutExpired:
+        logger.warning("Denoising timed out")
+        return False
+    except Exception as e:
+        logger.warning(f"Denoising failed: {e}")
+        return False
+
+
+def apply_sharpening_reduction(input_path: Path, output_path: Path) -> bool:
+    """
+    Apply sharpening reduction using FFmpeg unsharp filter with negative values.
+    This reduces over-sharpening artifacts from HAT-L when the source is already sharp.
+    
+    Args:
+        input_path: Path to input video (upscaled)
+        output_path: Path to output video with reduced sharpening
+        
+    Returns:
+        bool: True if sharpening reduction succeeded, False otherwise
+    """
+    # Use unsharp filter with negative values to reduce sharpening
+    # luma_msize_x:luma_msize_y:luma_amount:chroma_msize_x:chroma_msize_y:chroma_amount
+    # Negative amount values reduce sharpening
+    sharpen_reduction_cmd = [
+        "ffmpeg",
+        "-i", str(input_path),
+        "-vf", "unsharp=3:3:-0.5:3:3:-0.3",  # Reduce luma and chroma sharpening
+        "-c:v", "libx265",
+        "-preset", "slow",
+        "-crf", "20",
+        "-profile:v", "main",
+        "-pix_fmt", "yuv420p",
+        "-sar", "1:1",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-colorspace", "bt709",
+        "-movflags", "+faststart",
+        "-c:a", "copy",  # Copy audio without re-encoding
+        "-y",
+        str(output_path)
+    ]
+    
+    try:
+        result = subprocess.run(
+            sharpen_reduction_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300
+        )
+        return result.returncode == 0 and output_path.exists()
+    except subprocess.TimeoutExpired:
+        logger.warning("Sharpening reduction timed out")
+        return False
+    except Exception as e:
+        logger.warning(f"Sharpening reduction failed: {e}")
+        return False
 
 
 def get_frame_rate(input_file: Path) -> float:
@@ -165,6 +318,47 @@ def upscale_video(payload_video_path: str, task_type: str):
             raise HTTPException(status_code=500, detail="MP4 video file with extra frames was not created.")
         print(f"Step 1 completed in {elapsed_time:.2f} seconds. File with extra frames: {output_file_with_extra_frames}")
 
+        # Step 1.5: Content-aware pre-processing (noise detection and optional denoising)
+        print("Step 1.5: Analyzing video quality for content-aware pre-processing...")
+        preprocessing_start = time.time()
+        
+        # Detect noise and sharpness levels
+        noise_score, sharpness_score = detect_noise_and_sharpness(output_file_with_extra_frames)
+        print(f"  Noise/Sharpness score (Laplacian variance): {noise_score:.2f}")
+        print(f"  Noise threshold: {NOISE_THRESHOLD}, Sharpness threshold: {SHARPNESS_THRESHOLD}")
+        
+        # Determine if source is noisy (low Laplacian variance indicates noise)
+        is_noisy = noise_score < NOISE_THRESHOLD
+        # Determine if source is already sharp (high Laplacian variance indicates sharpness)
+        is_sharp = sharpness_score > SHARPNESS_THRESHOLD
+        
+        print(f"  Is noisy: {is_noisy}, Is already sharp: {is_sharp}")
+        
+        # Apply denoising if video is noisy
+        processed_file = output_file_with_extra_frames
+        if is_noisy:
+            print("  Noisy input detected. Applying light denoising with hqdn3d...")
+            denoised_file = output_file_with_extra_frames.with_name(f"{input_file.stem}_denoised.mp4")
+            
+            if apply_denoising(output_file_with_extra_frames, denoised_file):
+                print(f"  Denoising completed. Using denoised file: {denoised_file}")
+                # Clean up the non-denoised file to save space
+                if output_file_with_extra_frames.exists():
+                    output_file_with_extra_frames.unlink()
+                processed_file = denoised_file
+            else:
+                print("  Denoising failed, continuing with original file")
+                if denoised_file.exists():
+                    denoised_file.unlink()
+        
+        preprocessing_elapsed = time.time() - preprocessing_start
+        print(f"Step 1.5 completed in {preprocessing_elapsed:.2f} seconds")
+        
+        # Store sharpness info for HAT-L post-processing adjustment
+        # When source is already sharp, we apply sharpening reduction to avoid artifacts
+        source_sharpness_level = "high" if is_sharp else "normal"
+        print(f"  Source sharpness level: {source_sharpness_level}")
+
         # Step 2: Upscale video using HAT-L model
         print("Step 2: Upscaling video using HAT-L...")
         start_time = time.time()
@@ -194,7 +388,7 @@ def upscale_video(payload_video_path: str, task_type: str):
         
         extract_cmd = [
             "ffmpeg",
-            "-i", str(output_file_with_extra_frames),
+            "-i", str(processed_file),
             "-q:v", "2",  # High quality
             str(frames_dir / "frame_%08d.png")
         ]
@@ -250,25 +444,64 @@ def upscale_video(payload_video_path: str, task_type: str):
                 print(f"Processed batch {batch_idx + 1}/{num_batches} ({end_idx}/{len(frame_files)} frames)...")
         
         # Encode upscaled frames back to video
-        encode_cmd = [
-            "ffmpeg",
-            "-framerate", str(frame_rate),
-            "-i", str(upscaled_frames_dir / "frame_%08d.png"),
-            "-c:v", "libx265",
-            "-preset", "slow",
-            "-crf", "20",
-            "-profile:v", "main",
-            "-pix_fmt", "yuv420p",
-            "-sar", "1:1",
-            "-color_primaries", "bt709",
-            "-color_trc", "bt709",
-            "-colorspace", "bt709",
-            "-movflags", "+faststart",
-            "-y",  # Overwrite output
-            str(output_file_upscaled)
-        ]
-        
-        encode_process = subprocess.run(encode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # If source was already sharp, apply sharpening reduction to avoid artifacts
+        if is_sharp:
+            print("  Source was already sharp. Applying sharpening reduction to avoid over-sharpening artifacts...")
+            temp_upscaled_file = temp_dir / "upscaled_temp.mp4"
+            encode_cmd = [
+                "ffmpeg",
+                "-framerate", str(frame_rate),
+                "-i", str(upscaled_frames_dir / "frame_%08d.png"),
+                "-c:v", "libx265",
+                "-preset", "slow",
+                "-crf", "20",
+                "-profile:v", "main",
+                "-pix_fmt", "yuv420p",
+                "-sar", "1:1",
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709",
+                "-movflags", "+faststart",
+                "-y",  # Overwrite output
+                str(temp_upscaled_file)
+            ]
+            
+            encode_process = subprocess.run(encode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            if encode_process.returncode == 0 and temp_upscaled_file.exists():
+                # Apply sharpening reduction
+                if apply_sharpening_reduction(temp_upscaled_file, output_file_upscaled):
+                    print(f"  Sharpening reduction applied. Final output: {output_file_upscaled}")
+                    # Clean up temp file
+                    if temp_upscaled_file.exists():
+                        temp_upscaled_file.unlink()
+                else:
+                    print("  Sharpening reduction failed, using upscaled video without reduction")
+                    # Rename temp file to output
+                    temp_upscaled_file.rename(output_file_upscaled)
+            else:
+                print(f"  Video encoding failed: {encode_process.stderr.strip()}")
+        else:
+            # Normal encoding without sharpening reduction
+            encode_cmd = [
+                "ffmpeg",
+                "-framerate", str(frame_rate),
+                "-i", str(upscaled_frames_dir / "frame_%08d.png"),
+                "-c:v", "libx265",
+                "-preset", "slow",
+                "-crf", "20",
+                "-profile:v", "main",
+                "-pix_fmt", "yuv420p",
+                "-sar", "1:1",
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709",
+                "-movflags", "+faststart",
+                "-y",  # Overwrite output
+                str(output_file_upscaled)
+            ]
+            
+            encode_process = subprocess.run(encode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
         # Cleanup temporary directories
         if temp_dir.exists():
@@ -285,9 +518,11 @@ def upscale_video(payload_video_path: str, task_type: str):
         print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
 
         # Cleanup intermediate files if needed
-        if output_file_with_extra_frames.exists():
-            output_file_with_extra_frames.unlink()
-            print(f"Intermediate file {output_file_with_extra_frames} deleted.")
+        # Note: processed_file is either output_file_with_extra_frames or the denoised file
+        # If denoising was applied, output_file_with_extra_frames was already deleted during denoising
+        if processed_file.exists():
+            processed_file.unlink()
+            print(f"Intermediate file {processed_file} deleted.")
             
         if input_file.exists():
             input_file.unlink()
