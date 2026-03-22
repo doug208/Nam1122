@@ -15,6 +15,9 @@ from utils.processing_utils import (
 from utils.encode_video import encode_video
 from utils.classify_scene import load_scene_classifier_model, CombinedModel
 
+# Module-level cache for encoding resources (scene classifier model and preprocessing pipeline)
+_encoding_resources_cache = None
+
 def get_cq_from_lookup_table(scene_type, config, target_vmaf=None, target_quality_level=None):
     """
     Look up the recommended CQ (Constant Quality) value for a scene type and target quality.
@@ -480,6 +483,34 @@ def load_encoding_resources(config, logging_enabled=True):
         "cq_min": cq_min,                                 
         "cq_max": cq_max                                  
     }
+
+def get_or_load_encoding_resources(config, logging_enabled=True):
+    """
+    Gets cached encoding resources or loads them from disk if not cached.
+    
+    This function implements module-level caching to avoid reloading
+    the scene classifier model and preprocessing pipeline on every request.
+    
+    Args:
+        config (dict): Configuration containing model file paths
+        logging_enabled (bool): Whether to print loading status messages
+        
+    Returns:
+        dict: Cached or freshly loaded encoding resources
+    """
+    global _encoding_resources_cache
+    
+    if _encoding_resources_cache is None:
+        if logging_enabled:
+            print(f"   📦 Loading encoding resources from disk (first time)...")
+        _encoding_resources_cache = load_encoding_resources(config, logging_enabled)
+        if logging_enabled:
+            print(f"   ✅ Encoding resources cached for reuse")
+    else:
+        if logging_enabled:
+            print(f"   📦 Using cached encoding resources")
+    
+    return _encoding_resources_cache
 
 def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_quality_level=None, logging_enabled=True):
     """
