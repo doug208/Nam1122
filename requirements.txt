@@ -54,3 +54,6 @@ streamlit==1.22.0
 psutil==7.1.0
 nvidia-ml-py==13.580.82
 termcolor==3.1.0
+
+# Image Super-Resolution
+spandrel==0.4.1
