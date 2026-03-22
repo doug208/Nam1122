@@ -7,7 +7,61 @@ import re
 import time
 import traceback
 import numpy as np
+import subprocess
 from .encoder_configs import ENCODER_SETTINGS, SCENE_SPECIFIC_PARAMS, MODEL_CQ_REFERENCE_CODEC, QUALITY_MAPPING_ANCHORS
+
+
+def check_codec_availability(codec):
+    """
+    Check if a codec is available in the current FFmpeg installation.
+    
+    Args:
+        codec (str): Codec name to check (e.g., 'libsvtav1', 'av1_nvenc')
+        
+    Returns:
+        bool: True if codec is available, False otherwise
+    """
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-codecs'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return codec in result.stdout
+    except Exception:
+        return False
+
+
+def select_av1_codec(prefer_software=True):
+    """
+    Select the best available AV1 codec.
+    Tries libsvtav1 first (software) for better compression ratio,
+    falls back to av1_nvenc (hardware) if not available.
+    
+    Args:
+        prefer_software (bool): Whether to prefer software encoding (libsvtav1)
+        
+    Returns:
+        str: Selected codec name ('libsvtav1' or 'av1_nvenc')
+    """
+    if prefer_software:
+        # Try libsvtav1 first for better compression ratio
+        if check_codec_availability('libsvtav1'):
+            return 'libsvtav1'
+        # Fall back to av1_nvenc
+        if check_codec_availability('av1_nvenc'):
+            return 'av1_nvenc'
+    else:
+        # Try av1_nvenc first for speed
+        if check_codec_availability('av1_nvenc'):
+            return 'av1_nvenc'
+        # Fall back to libsvtav1
+        if check_codec_availability('libsvtav1'):
+            return 'libsvtav1'
+    
+    # Default fallback
+    return 'libsvtav1'
 
 def cleanup_quality_params(settings, keep_param=None):
     """
@@ -259,7 +313,7 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
     Args:
         input_path (str): Path to input video file
         output_path (str): Path for output video file
-        codec (str): Video codec to use (e.g., 'av1_nvenc', 'libx264')
+        codec (str): Video codec to use (e.g., 'av1_nvenc', 'libx264', 'av1' for auto-selection)
         rate (int/float, optional): Quality parameter (CQ value from model)
         preset (str, optional): Encoder preset override
         scene_type (str, optional): Scene classification for optimization
@@ -271,6 +325,13 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
     Returns:
         tuple: (encoding_results_log, encoding_time) or (None, None) on failure
     """
+    
+    # Auto-select AV1 codec for better compression ratio
+    # libsvtav1 (software) is preferred over av1_nvenc (hardware) for compression efficiency
+    if codec == 'av1':
+        codec = select_av1_codec(prefer_software=True)
+        if logging_enabled:
+            print(f"Auto-selected AV1 codec: {codec}")
     
     if logging_enabled:
         print(f"Encoding video using codec: {codec}, scene: {scene_type}, model_predicted_rate: {rate}")
@@ -286,6 +347,23 @@ def encode_video(input_path, output_path, codec, rate=None, preset=None, scene_t
     # --- Parameter Prioritization ---
     # 1. Start with base settings
     current_settings = base_settings.copy()
+    
+    # 1.5 Apply codec-specific optimizations for better compression ratio
+    if codec == 'av1_nvenc':
+        # Add tuning parameters for better quality-per-bit efficiency
+        current_settings['tune'] = 'vmaf'  # Optimize for perceptual quality
+        current_settings['tile-columns'] = 2  # Better parallelization
+        if logging_enabled:
+            print(f"Applied av1_nvenc optimizations: tune=vmaf, tile-columns=2")
+    
+    elif codec == 'libsvtav1':
+        # Apply target encode settings for SVT-AV1
+        # Use preset 6 for good balance of speed vs compression
+        current_settings['preset'] = '6'
+        # Use svtav1-params for tune=0 (subjective quality)
+        current_settings['svtav1-params'] = 'tune=0'
+        if logging_enabled:
+            print(f"Applied libsvtav1 optimizations: preset=6, svtav1-params=tune=0")
 
     # 2. Apply scene-specific overrides if scene_type is provided
     if scene_type:
