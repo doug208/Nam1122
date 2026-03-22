@@ -35,6 +35,9 @@ SHARPNESS_REDUCTION_SIGMA = 0.5  # Gaussian blur sigma for sharpness reduction
 
 app = FastAPI()
 
+# Module-level cache for loaded HAT-L models
+_model_cache = {}
+
 class UpscaleRequest(BaseModel):
     payload_url: str
     task_type: str
@@ -84,6 +87,28 @@ def get_hat_model_path(scale_factor: str) -> Path:
         print(f"Using cached HAT-L {scale_factor}x weights from {model_path}")
     
     return model_path
+
+
+def get_or_load_model(scale_factor: str, device: torch.device):
+    """
+    Gets a cached HAT-L model or loads it from disk if not cached.
+    
+    Args:
+        scale_factor: The upscaling factor ("2" or "4")
+        device: The torch device to load the model on
+        
+    Returns:
+        The loaded HAT-L model ready for inference.
+    """
+    cache_key = f"hat_l_{scale_factor}_{device}"
+    if cache_key not in _model_cache:
+        model_weights_path = get_hat_model_path(scale_factor)
+        loader = ModelLoader()
+        model_descriptor = loader.load_from_file(str(model_weights_path))
+        model = model_descriptor.model.to(device)
+        model.eval()
+        _model_cache[cache_key] = model
+    return _model_cache[cache_key]
 
 
 def detect_noise_and_sharpness(video_path: Path, sample_count: int = MAX_SAMPLE_FRAMES) -> tuple[float, float]:
@@ -363,19 +388,13 @@ def upscale_video(payload_video_path: str, task_type: str):
         print("Step 2: Upscaling video using HAT-L...")
         start_time = time.time()
         
-        # Load HAT-L model using spandrel with pretrained weights
+        # Load HAT-L model using spandrel with pretrained weights (cached)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
         
-        # Download and load pretrained HAT-L weights
-        model_weights_path = get_hat_model_path(scale_factor)
-        
-        # Load model with pretrained weights using spandrel ModelLoader
+        # Get cached model or load from disk
         print(f"Loading HAT-L {scale_factor}x model with pretrained weights...")
-        loader = ModelLoader()
-        model_descriptor = loader.load_from_file(str(model_weights_path))
-        model = model_descriptor.model.to(device)
-        model.eval()
+        model = get_or_load_model(scale_factor, device)
         print(f"HAT-L {scale_factor}x model loaded successfully")
         
         # Process video frames
@@ -582,6 +601,16 @@ async def video_upscaler(request: UpscaleRequest):
         logger.error(f"Failed to process upscaling request: {e}")
         traceback.print_exc()
         return {"uploaded_video_url": None}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Pre-load HAT-L models at startup to eliminate first-request overhead."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Pre-loading HAT-L models on device: {device}")
+    get_or_load_model("2", device)
+    get_or_load_model("4", device)
+    logger.info("HAT-L models pre-loaded successfully")
 
 
 if __name__ == "__main__":
