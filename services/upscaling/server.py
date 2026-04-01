@@ -1,4 +1,13 @@
+import sys
+import sys
+sys.path.insert(0, "/workspace/Nam1122")
+from services.upscaling.realesrgan_upscaler import upscale_video_realesrgan
+sys.path.insert(0, ".")
 from fastapi import FastAPI, HTTPException
+import torch
+import cv2
+import numpy as np
+import shutil
 from pydantic import BaseModel
 from pathlib import Path
 import subprocess
@@ -110,35 +119,19 @@ def upscale_video(payload_video_path: str, task_type: str):
             raise HTTPException(status_code=500, detail="MP4 video file with extra frames was not created.")
         print(f"Step 1 completed in {elapsed_time:.2f} seconds. File with extra frames: {output_file_with_extra_frames}")
 
-        # Step 2: Upscale video using video2x
-        print("Step 2: Upscaling video using video2x...")
+        # Step 2: Upscale video using Real-ESRGAN CUDA
+        print("Step 2: Upscaling video using Real-ESRGAN CUDA...")
         start_time = time.time()
-        video2x_command = [
-            "video2x",
-            "-i", str(output_file_with_extra_frames),
-            "-o", str(output_file_upscaled),
-            "-p", "realesrgan",               
-            "-s", scale_factor,               
-            "-c", "libx265",                  
-            "-e", "preset=slow",              
-            "-e", "crf=20",                   
-            "-e", "profile=main",             
-            "-e", "pix_fmt=yuv420p",          
-            "-e", "sar=1:1",                  
-            "-e", "color_primaries=bt709",    
-            "-e", "color_trc=bt709",
-            "-e", "colorspace=bt709",
-            "-e", "movflags=+faststart",
-        ]
-        video2x_process = subprocess.run(video2x_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        upscale_video_realesrgan(
+            str(output_file_with_extra_frames),
+            str(output_file_upscaled),
+            scale=int(scale_factor),
+            frame_rate=frame_rate
+        )
         elapsed_time = time.time() - start_time
-        if video2x_process.returncode != 0:
-            print(f"Upscaling failed: {video2x_process.stderr.strip()}")
-            raise HTTPException(status_code=500, detail=f"Upscaling failed: {video2x_process.stderr.strip()}")
         if not output_file_upscaled.exists():
-            print("Upscaled MP4 video file was not created.")
             raise HTTPException(status_code=500, detail="Upscaled MP4 video file was not created.")
-        print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
+        print(f"Step 2 Real-ESRGAN completed in {elapsed_time:.2f} seconds. Upscaled MP4: {output_file_upscaled}")
 
         # Cleanup intermediate files if needed
         if output_file_with_extra_frames.exists():
@@ -154,6 +147,10 @@ def upscale_video(payload_video_path: str, task_type: str):
     except Exception as e:
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.post("/upscale-video")
 async def video_upscaler(request: UpscaleRequest):

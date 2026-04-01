@@ -6,7 +6,7 @@ class RedisConfig(BaseModel):
     host: str = Field(default="localhost")
     port: int = Field(default=6379)
     db: int = Field(default=0)
-    delete_after_second: int = Field(default=600)
+    delete_after_second: int = Field(default=604800)
     redis_ttl: int = Field(default= 60 * 60 * 6) # 6 hours
     presigned_url_ttl: int = Field(default= 60 * 60 * 24 * 7) # 7 days
     organic_upscaling_queue_key: str = Field(default="organic_upscaling_queue")
