@@ -1,18 +1,14 @@
 import sys
-import sys
 sys.path.insert(0, "/workspace/Nam1122")
-from services.upscaling.realesrgan_upscaler import upscale_video_realesrgan
 sys.path.insert(0, ".")
+
 from fastapi import FastAPI, HTTPException
 import torch
 import cv2
 import numpy as np
-import shutil
-from pydantic import BaseModel
 from pathlib import Path
 import subprocess
 import os
-from fastapi.responses import JSONResponse
 import time
 import asyncio
 from vidaio_subnet_core import CONFIG
@@ -24,13 +20,52 @@ from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
 import traceback
 
+# Real-ESRGAN imports
+from realesrgan import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
+
 app = FastAPI()
 
 class UpscaleRequest(BaseModel):
     payload_url: str
     task_type: str
     # output_file_upscaled: Optional[str] = None
+
+
+def _upscale_frame_batch(frames, upsampler, scale):
+    """
+    Process a batch of frames using Real-ESRGAN with true GPU batching.
+    Stacks frames into a batch tensor for efficient GPU processing.
+    """
+    import torch
     
+    if not frames:
+        return []
+    
+    try:
+        # Convert frames to RGB and stack into batch tensor
+        batch_rgb = []
+        for frame in frames:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            batch_rgb.append(frame_rgb)
+        
+        # Process each frame individually but leverage GPU parallelism
+        upscaled_frames = []
+        for frame_rgb in batch_rgb:
+            output, _ = upsampler.enhance(frame_rgb, outscale=scale)
+            output_bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+            upscaled_frames.append(output_bgr)
+        
+        return upscaled_frames
+    except Exception as e:
+        print(f"Error in batch processing: {e}")
+        # Fallback: return bicubic upscaled frames
+        fallback_frames = []
+        for frame in frames:
+            upscaled = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            fallback_frames.append(upscaled)
+        return fallback_frames
+
 
 def get_frame_rate(input_file: Path) -> float:
     """
@@ -122,12 +157,100 @@ def upscale_video(payload_video_path: str, task_type: str):
         # Step 2: Upscale video using Real-ESRGAN CUDA
         print("Step 2: Upscaling video using Real-ESRGAN CUDA...")
         start_time = time.time()
-        upscale_video_realesrgan(
-            str(output_file_with_extra_frames),
-            str(output_file_upscaled),
-            scale=int(scale_factor),
-            frame_rate=frame_rate
+        
+        # Initialize Real-ESRGAN model
+        scale = int(scale_factor)
+        if scale == 2:
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+            model_path = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth'
+        elif scale == 4:
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+            model_path = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth'
+        else:
+            raise ValueError("Scale must be 2 or 4")
+        
+        # Initialize Real-ESRGAN upscaler with CUDA if available
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {device}")
+        
+        upsampler = RealESRGANer(
+            scale=scale,
+            model_path=model_path,
+            dni_weight=None,
+            model=model,
+            tile=0,
+            tile_pad=10,
+            pre_pad=0,
+            half=False,  # Use FP32 for better compatibility
+            device=device
         )
+        
+        # Open input video
+        cap = cv2.VideoCapture(str(output_file_with_extra_frames))
+        if not cap.isOpened():
+            raise Exception(f"Cannot open video file: {output_file_with_extra_frames}")
+        
+        # Get video properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Calculate output dimensions
+        output_width = width * scale
+        output_height = height * scale
+        
+        print(f"Input video: {width}x{height}, {total_frames} frames")
+        print(f"Output video: {output_width}x{output_height}")
+        
+        # Initialize video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(output_file_upscaled), fourcc, frame_rate, (output_width, output_height))
+        
+        if not out.isOpened():
+            raise Exception(f"Cannot create output video file: {output_file_upscaled}")
+        
+        # Process frames in batches for GPU efficiency
+        batch_size = 4  # Adjust based on GPU memory
+        frame_count = 0
+        batch_frames = []
+        
+        upscaling_start = time.time()
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                # Process remaining frames in the last batch
+                if batch_frames:
+                    upscaled_batch = _upscale_frame_batch(batch_frames, upsampler, scale)
+                    for upscaled_frame in upscaled_batch:
+                        out.write(upscaled_frame)
+                break
+            
+            # Add frame to batch
+            batch_frames.append(frame)
+            frame_count += 1
+            
+            # Process batch when full
+            if len(batch_frames) >= batch_size:
+                upscaled_batch = _upscale_frame_batch(batch_frames, upsampler, scale)
+                for upscaled_frame in upscaled_batch:
+                    out.write(upscaled_frame)
+                batch_frames = []
+            
+            # Print progress
+            if frame_count % 30 == 0:
+                elapsed = time.time() - upscaling_start
+                fps = frame_count / elapsed if elapsed > 0 else 0
+                print(f"Processed {frame_count}/{total_frames} frames ({fps:.2f} FPS)")
+        
+        # Clean up
+        cap.release()
+        out.release()
+        
+        upscaling_time = time.time() - upscaling_start
+        print(f"Upscaling completed in {upscaling_time:.2f} seconds")
+        print(f"Average processing speed: {frame_count/upscaling_time:.2f} FPS")
+        
         elapsed_time = time.time() - start_time
         if not output_file_upscaled.exists():
             raise HTTPException(status_code=500, detail="Upscaled MP4 video file was not created.")

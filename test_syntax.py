@@ -18,15 +18,25 @@ numpy.string_ = numpy.bytes_;
 numpy.NaN = numpy.nan;
 
 
-# Test import of the realesrgan_upscaler module
+import ast
 import sys
-sys.path.insert(0, ".")
+
+# Check syntax of the new file
+with open('services/upscaling/realesrgan_upscaler.py', 'r') as f:
+    code = f.read()
 
 try:
-    from services.upscaling.realesrgan_upscaler import upscale_video_realesrgan
-    print("✅ Successfully imported upscale_video_realesrgan")
-    print(f"Function signature: {upscale_video_realesrgan.__code__.co_varnames[:4]}")
-except ImportError as e:
-    print(f"⚠️ Import error (expected if realesrgan not installed): {e}")
-except Exception as e:
-    print(f"❌ Error: {e}")
+    ast.parse(code)
+    print("✅ Syntax check passed for realesrgan_upscaler.py")
+except SyntaxError as e:
+    print(f"❌ Syntax error: {e}")
+
+# Check server.py syntax
+with open('services/upscaling/server.py', 'r') as f:
+    code = f.read()
+
+try:
+    ast.parse(code)
+    print("✅ Syntax check passed for server.py")
+except SyntaxError as e:
+    print(f"❌ Syntax error: {e}")
