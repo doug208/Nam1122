@@ -56,5 +56,5 @@ streamlit==1.22.0
 
 # Utilities
 psutil==7.1.0
-nvidia-ml-py==13.580.82
+nvidia-ml-py==13.590.44
 termcolor==3.1.0
