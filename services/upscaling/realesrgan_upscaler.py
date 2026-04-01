@@ -39,7 +39,7 @@ def upscale_video_realesrgan(input_video_path: str, output_video_path: str, scal
         model_path=model_path,
         dni_weight=None,
         model=model,
-        tile=0,
+        tile=512,
         tile_pad=10,
         pre_pad=0,
         half=False,  # Use FP32 for better compatibility
