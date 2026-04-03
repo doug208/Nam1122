@@ -53,6 +53,15 @@ def _upscale_frame_batch(frames, upsampler, scale):
         upscaled_frames = []
         for frame_rgb in batch_rgb:
             output, _ = upsampler.enhance(frame_rgb, outscale=scale)
+            
+            # Post-processing: Apply unsharp mask for better perceptual quality
+            # This enhances edges and details which improves VMAF and PieAPP scores
+            gaussian = cv2.GaussianBlur(output, (0, 0), 3)
+            output = cv2.addWeighted(output, 1.5, gaussian, -0.5, 0)
+            
+            # Clamp values to valid range
+            output = np.clip(output, 0, 255).astype(np.uint8)
+            
             output_bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
             upscaled_frames.append(output_bgr)
         
@@ -181,7 +190,7 @@ def upscale_video(payload_video_path: str, task_type: str):
             tile=0,
             tile_pad=10,
             pre_pad=0,
-            half=False,  # Use FP32 for better compatibility
+            half=True,  # Use FP16 for faster inference on RTX 4090
             device=device
         )
         
@@ -202,12 +211,14 @@ def upscale_video(payload_video_path: str, task_type: str):
         print(f"Input video: {width}x{height}, {total_frames} frames")
         print(f"Output video: {output_width}x{output_height}")
         
-        # Initialize video writer
+        # Initialize video writer with high-quality H.264 encoding for better VMAF scores
+        # Using mp4v fourcc for compatibility, but we'll re-encode with libx264 for final output
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(str(output_file_upscaled), fourcc, frame_rate, (output_width, output_height))
+        temp_output_path = output_file_upscaled.with_suffix('.temp.mp4')
+        out = cv2.VideoWriter(str(temp_output_path), fourcc, frame_rate, (output_width, output_height))
         
         if not out.isOpened():
-            raise Exception(f"Cannot create output video file: {output_file_upscaled}")
+            raise Exception(f"Cannot create output video file: {temp_output_path}")
         
         # Process frames in batches for GPU efficiency
         batch_size = 4  # Adjust based on GPU memory
@@ -250,6 +261,36 @@ def upscale_video(payload_video_path: str, task_type: str):
         upscaling_time = time.time() - upscaling_start
         print(f"Upscaling completed in {upscaling_time:.2f} seconds")
         print(f"Average processing speed: {frame_count/upscaling_time:.2f} FPS")
+        
+        # Re-encode with libx264 for better VMAF scores
+        print("Re-encoding with libx264 for optimal quality...")
+        reencode_start = time.time()
+        reencode_command = [
+            "ffmpeg",
+            "-i", str(temp_output_path),
+            "-c:v", "libx264",
+            "-preset", "fast",  # Balance between speed and quality
+            "-crf", "18",       # High quality (lower is better, 18 is visually lossless)
+            "-pix_fmt", "yuv420p",  # Standard pixel format for compatibility
+            "-movflags", "+faststart",  # Enable fast start for web playback
+            "-c:a", "copy",     # Copy audio if present
+            "-y",               # Overwrite output file
+            str(output_file_upscaled)
+        ]
+        
+        reencode_process = subprocess.run(
+            reencode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        
+        if reencode_process.returncode != 0:
+            print(f"Re-encoding failed: {reencode_process.stderr.strip()}")
+            # Fallback: use the temp file as output
+            temp_output_path.rename(output_file_upscaled)
+        else:
+            # Remove temp file after successful re-encoding
+            if temp_output_path.exists():
+                temp_output_path.unlink()
+            print(f"Re-encoding completed in {time.time() - reencode_start:.2f} seconds")
         
         elapsed_time = time.time() - start_time
         if not output_file_upscaled.exists():
