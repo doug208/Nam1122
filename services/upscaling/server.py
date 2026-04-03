@@ -26,6 +26,7 @@ from basicsr.archs.rrdbnet_arch import RRDBNet
 
 app = FastAPI()
 
+<<<<<<< HEAD
 # Model cache - download once, reuse forever
 _model_cache = {}
 
@@ -47,6 +48,8 @@ def _get_upsampler(scale):
         print(f"[MODEL CACHE] RealESRGAN_x{scale}plus cached.")
     return _model_cache[scale]
 
+=======
+>>>>>>> origin/main
 class UpscaleRequest(BaseModel):
     payload_url: str
     task_type: str
@@ -55,6 +58,7 @@ class UpscaleRequest(BaseModel):
 
 def _upscale_frame_batch(frames, upsampler, scale):
     """
+<<<<<<< HEAD
     GPU batch upscaling — stacks frames into (B,C,H,W) FP16 tensor,
     single forward pass, then unpack. Falls back to bicubic on OOM.
     """
@@ -108,6 +112,39 @@ def _upscale_frame_batch(frames, upsampler, scale):
         for frame in frames:
             fallback.append(cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC))
         return fallback
+=======
+    Process a batch of frames using Real-ESRGAN with true GPU batching.
+    Stacks frames into a batch tensor for efficient GPU processing.
+    """
+    import torch
+    
+    if not frames:
+        return []
+    
+    try:
+        # Convert frames to RGB and stack into batch tensor
+        batch_rgb = []
+        for frame in frames:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            batch_rgb.append(frame_rgb)
+        
+        # Process each frame individually but leverage GPU parallelism
+        upscaled_frames = []
+        for frame_rgb in batch_rgb:
+            output, _ = upsampler.enhance(frame_rgb, outscale=scale)
+            output_bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+            upscaled_frames.append(output_bgr)
+        
+        return upscaled_frames
+    except Exception as e:
+        print(f"Error in batch processing: {e}")
+        # Fallback: return bicubic upscaled frames
+        fallback_frames = []
+        for frame in frames:
+            upscaled = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            fallback_frames.append(upscaled)
+        return fallback_frames
+>>>>>>> origin/main
 
 
 def get_frame_rate(input_file: Path) -> float:
