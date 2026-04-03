@@ -462,6 +462,7 @@ def load_encoding_resources(config, logging_enabled=True):
 <<<<<<< HEAD
     device = 'cpu'  # FORCED CPU - compressor never gets jobs, scene classifier was hoarding 23GB GPU
 =======
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 >>>>>>> origin/main
 
     # Load scene classifier AI model
