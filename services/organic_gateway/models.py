@@ -1,0 +1,89 @@
+from enum import Enum
+from typing import Optional, Literal
+from pydantic import BaseModel
+
+# Task status enum
+class TaskStatus(str, Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+# API Models
+class UpscaleRequest(BaseModel):
+    chunk_id: str
+    chunk_url: str
+    resolution_type: Literal["SD2HD", "SD24K", "HD24K"]
+
+class TaskCountResponse(BaseModel):
+    compression_count: int
+    upscaling_count: int
+    total_count: int
+
+class UpscaleResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    message: str
+
+TARGET_CODECS = [
+    "av1",        # AV1 codec (protocol standard name)
+    # "hevc",       # H.265/HEVC (protocol standard name) 
+    # "h264",       # H.264/AVC (protocol standard name)
+    # "vp9",        # VP9 (protocol standard name)
+]
+
+class CompressionRequest(BaseModel):
+    chunk_id: str
+    chunk_url: str
+    compression_type: Literal["High", "Medium", "Low"]
+    target_codec: Literal["av1", "hevc", "h264", "vp9"] = "av1"  # Default to av1 for best compression
+    codec_mode: Literal["VBR", "CRF"] = "CRF"  # VBR, or CRF (default)
+    target_bitrate: Optional[float] = 10.0  # Target bitrate in Mbps
+
+class CompressionResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    message: str
+
+class StatusResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    message: str
+    created_at: str
+    updated_at: str
+    progress: Optional[float] = None
+
+class ResultResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    original_video_url: str
+    processed_video_url: Optional[str] = None
+    score: Optional[float] = None
+    message: str
+
+# Redis Service Models
+class InsertOrganicUpscalingRequest(BaseModel):
+    url: str
+    chunk_id: str
+    task_id: str
+    resolution_type: Literal["SD2HD", "SD24K", "HD24K"]
+
+class InsertOrganicCompressionRequest(BaseModel):
+    url: str
+    chunk_id: str
+    task_id: str
+    compression_type: Literal["High", "Medium", "Low"]
+    target_codec: Optional[str] = "av1"
+    codec_mode: Optional[str] = "CRF"
+    target_bitrate: Optional[float] = 10.0
+
+class InsertResultRequest(BaseModel):
+    processed_video_url: str
+    original_video_url: str
+    score: float
+    task_id: str
+
+class UpdateTaskStatusRequest(BaseModel):
+    status: TaskStatus
+    original_video_url: Optional[str] = None
+    progress: Optional[float] = None
