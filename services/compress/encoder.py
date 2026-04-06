@@ -459,7 +459,7 @@ def load_encoding_resources(config, logging_enabled=True):
     preprocessing_pipeline_path = model_paths.get('preprocessing_pipeline', "services/compress/models/preprocessing_pipeline.pkl")
     
     # Choose GPU if available, otherwise use CPU
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cpu'  # FORCED CPU - compressor never gets jobs, scene classifier was hoarding 23GB GPU
 
     # Load scene classifier AI model
     model_state_dict, available_metrics, class_mapping = load_scene_classifier_model(scene_model_path, device, logging_enabled)

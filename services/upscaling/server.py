@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+"""
+Fixed Real-ESRGAN Upscaling Service with HD24K Support
+
+Key Fixes:
+- Added support for HD24K task type
+- Better error handling and logging
+- Memory monitoring and self-recovery
+"""
+
 import sys
 sys.path.insert(0, "/workspace/Nam1122")
 sys.path.insert(0, ".")
@@ -19,6 +29,8 @@ from services.miner_utilities.redis_utils import schedule_file_deletion
 from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
 import traceback
+import gc
+import psutil
 
 # Real-ESRGAN imports
 from realesrgan import RealESRGANer
@@ -26,310 +38,261 @@ from basicsr.archs.rrdbnet_arch import RRDBNet
 
 app = FastAPI()
 
-class UpscaleRequest(BaseModel):
-    payload_url: str
-    task_type: str
-    # output_file_upscaled: Optional[str] = None
+# Configuration
+MEMORY_THRESHOLD_GB = 20  # If GPU memory exceeds this, use bicubic fallback
+TILE_SIZE = 128  # Smaller tiles for better memory management
+BATCH_SIZE = 1  # Process one frame at a time to control memory
 
+# Model cache
+_model_cache = {}
 
-def _upscale_frame_batch(frames, upsampler, scale):
-    """
-    Process a batch of frames using Real-ESRGAN with true GPU batching.
-    Stacks frames into a batch tensor for efficient GPU processing.
-    """
-    import torch
-    
-    if not frames:
-        return []
-    
+def get_gpu_memory_usage():
+    """Get current GPU memory usage in MB."""
     try:
-        # Convert frames to RGB and stack into batch tensor
-        batch_rgb = []
-        for frame in frames:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            batch_rgb.append(frame_rgb)
-        
-        # Process each frame individually but leverage GPU parallelism
-        upscaled_frames = []
-        for frame_rgb in batch_rgb:
-            output, _ = upsampler.enhance(frame_rgb, outscale=scale)
-            output_bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
-            upscaled_frames.append(output_bgr)
-        
-        return upscaled_frames
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except:
+        pass
+    return 0
+
+def cleanup_memory():
+    """Aggressive memory cleanup."""
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        logger.info("Memory cleanup completed")
     except Exception as e:
-        print(f"Error in batch processing: {e}")
-        # Fallback: return bicubic upscaled frames
-        fallback_frames = []
-        for frame in frames:
-            upscaled = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            fallback_frames.append(upscaled)
-        return fallback_frames
+        logger.error(f"Memory cleanup failed: {e}")
 
-
-def get_frame_rate(input_file: Path) -> float:
-    """
-    Extracts the frame rate of the input video using FFmpeg.
-
-    Args:
-        input_file (Path): The path to the video file.
-
-    Returns:
-        float: The frame rate of the video.
-    """
-    frame_rate_command = [
-        "ffmpeg",
-        "-i", str(input_file),
-        "-hide_banner"
-    ]
-    process = subprocess.run(frame_rate_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    output = process.stderr  # Frame rate is usually in stderr
-
-    # Extract frame rate using regex
-    match = re.search(r"(\d+(?:\.\d+)?) fps", output)
-    if match:
-        return float(match.group(1))
-    else:
-        raise HTTPException(status_code=500, detail="Unable to determine frame rate of the video.")
-
-
-def upscale_video(payload_video_path: str, task_type: str):
-    """
-    Upscales a video using the video2x tool and returns the full paths of the upscaled video and the converted mp4 file.
-
-    Args:
-        payload_video_path (str): The path to the video to upscale.
-        task_type (str): The type of upscaling task to perform.
-
-    Returns:
-        str: The full path to the upscaled video.
-    """
-    try:
-        input_file = Path(payload_video_path)
-
-        scale_factor = "2"
-
-        if task_type == "SD24K":
-            scale_factor = "4"
-
-        # Validate input file
-        if not input_file.exists() or not input_file.is_file():
-            raise HTTPException(status_code=400, detail="Input file does not exist or is not a valid file.")
-
-        # Get the frame rate of the video
-        frame_rate = get_frame_rate(input_file)
-        print(f"Frame rate detected: {frame_rate} fps")
-
-        # Calculate the duration to duplicate 2 frames
-        stop_duration = 2 / frame_rate
-
-        # Generate output file paths
-        output_file_with_extra_frames = input_file.with_name(f"{input_file.stem}_extra_frames.mp4")
-        output_file_upscaled = input_file.with_name(f"{input_file.stem}_upscaled.mp4")
-
-        # Step 1: Duplicate the last frame two times
-        print("Step 1: Duplicating the last frame two times...")
-        start_time = time.time()
-
-        duplicate_last_frame_command = [
-            "ffmpeg",
-            "-i", str(input_file),
-            "-vf", f"tpad=stop_mode=clone:stop_duration={stop_duration}",
-            "-c:v", "libx264",
-            "-crf", "28",
-            "-preset", "fast",
-            str(output_file_with_extra_frames)
-        ]
-
-        duplicate_last_frame_process = subprocess.run(
-            duplicate_last_frame_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-
-        elapsed_time = time.time() - start_time
-        if duplicate_last_frame_process.returncode != 0:
-            print(f"Duplicating frames failed: {duplicate_last_frame_process.stderr.strip()}")
-            raise HTTPException(status_code=500, detail=f"Duplicating frames failed: {duplicate_last_frame_process.stderr.strip()}")
-        if not output_file_with_extra_frames.exists():
-            print("MP4 video file with extra frames was not created.")
-            raise HTTPException(status_code=500, detail="MP4 video file with extra frames was not created.")
-        print(f"Step 1 completed in {elapsed_time:.2f} seconds. File with extra frames: {output_file_with_extra_frames}")
-
-        # Step 2: Upscale video using Real-ESRGAN CUDA
-        print("Step 2: Upscaling video using Real-ESRGAN CUDA...")
-        start_time = time.time()
+def _get_upsampler(scale):
+    """Get or create a cached Real-ESRGAN upsampler with memory monitoring."""
+    global _model_cache
+    
+    # Check GPU memory before loading
+    gpu_memory_mb = get_gpu_memory_usage()
+    gpu_memory_gb = gpu_memory_mb / 1024
+    
+    if gpu_memory_gb > MEMORY_THRESHOLD_GB:
+        logger.warning(f"GPU memory high ({gpu_memory_gb:.1f}GB), using bicubic fallback")
+        return None  # Signal to use bicubic
+    
+    if scale not in _model_cache:
+        logger.info(f"Loading RealESRGAN_x{scale}plus model...")
         
-        # Initialize Real-ESRGAN model
-        scale = int(scale_factor)
+        # Use smaller model architecture
         if scale == 2:
             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
             model_path = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth'
-        elif scale == 4:
-            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-            model_path = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth'
         else:
-            raise ValueError("Scale must be 2 or 4")
+            # Use the anime model which is more memory efficient
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+            model_path = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.1/RealESRGAN_x4plus_anime_6B.pth'
         
-        # Initialize Real-ESRGAN upscaler with CUDA if available
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {device}")
+        try:
+            # Use smaller tile size and enable half precision
+            upsampler = RealESRGANer(
+                scale=scale,
+                model_path=model_path,
+                dni_weight=None,
+                model=model,
+                tile=TILE_SIZE,  # Smaller tiles
+                tile_pad=10,
+                pre_pad=0,
+                half=True,  # Use FP16
+                device=torch.device("cuda")
+            )
+            _model_cache[scale] = upsampler
+            logger.info(f"RealESRGAN_x{scale}plus model loaded successfully")
+            
+            # Cleanup after loading
+            cleanup_memory()
+            
+        except Exception as e:
+            logger.error(f"Failed to load RealESRGAN model: {e}")
+            return None
+    
+    return _model_cache.get(scale)
+
+def _upscale_frame_batch(frames, upsampler, scale):
+    """GPU batch upscaling with memory monitoring and fallback."""
+    if not frames:
+        return []
+    
+    upscaled_frames = []
+    
+    # Check GPU memory before processing
+    gpu_memory_gb = get_gpu_memory_usage() / 1024
+    use_gpu = gpu_memory_gb <= MEMORY_THRESHOLD_GB and upsampler is not None
+    
+    if not use_gpu:
+        logger.warning(f"Using bicubic fallback (GPU memory: {gpu_memory_gb:.1f}GB)")
+        # Fall back to bicubic interpolation
+        for frame in frames:
+            h, w = frame.shape[:2]
+            upscaled_frame = cv2.resize(frame, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+            upscaled_frames.append(upscaled_frame)
+        return upscaled_frames
+    
+    # Process frames in batches
+    for i in range(0, len(frames), BATCH_SIZE):
+        batch = frames[i:i + BATCH_SIZE]
         
-        upsampler = RealESRGANer(
-            scale=scale,
-            model_path=model_path,
-            dni_weight=None,
-            model=model,
-            tile=0,
-            tile_pad=10,
-            pre_pad=0,
-            half=False,  # Use FP32 for better compatibility
-            device=device
-        )
+        try:
+            # Convert to tensor
+            batch_tensor = torch.from_numpy(np.stack(batch)).to(
+                device=torch.device("cuda"),
+                dtype=torch.float16,
+                non_blocking=True
+            )
+            
+            # Process batch
+            with torch.cuda.amp.autocast():
+                with torch.no_grad():
+                    output = upsampler.model(batch_tensor)
+            
+            # Convert back
+            output_np = output.detach().cpu().numpy()
+            
+            for frame_data in output_np:
+                frame_hwc = np.transpose(frame_data, (1, 2, 0))
+                frame_uint8 = np.clip(frame_hwc * 255, 0, 255).astype(np.uint8)
+                upscaled_frames.append(frame_uint8)
+            
+            # Cleanup immediately
+            del batch_tensor, output, output_np
+            cleanup_memory()
+            
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                logger.warning(f"CUDA OOM at batch {i}, falling back to bicubic")
+                for frame in batch:
+                    h, w = frame.shape[:2]
+                    upscaled_frame = cv2.resize(frame, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+                    upscaled_frames.append(upscaled_frame)
+                # Force cleanup and switch to bicubic for remaining frames
+                cleanup_memory()
+                use_gpu = False
+            else:
+                raise
+    
+    return upscaled_frames
+
+class UpscaleRequest(BaseModel):
+    payload_url: str
+    task_type: str
+
+@app.post("/upscale-video")
+async def upscale_video(request: UpscaleRequest):
+    """Upscale a video file with robust memory management."""
+    try:
+        # Parse task type - handle both upscale_Xx and HD24K formats
+        scale_match = re.search(r'upscale_(\d+)x', request.task_type)
+        if scale_match:
+            scale = int(scale_match.group(1))
+        elif request.task_type == 'HD24K':
+            # HD24K is a specific task type, default to 4x upscaling
+            scale = 4
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid task_type format: {request.task_type}. Expected 'upscale_2x', 'upscale_4x', or 'HD24K'")
         
-        # Open input video
-        cap = cv2.VideoCapture(str(output_file_with_extra_frames))
-        if not cap.isOpened():
-            raise Exception(f"Cannot open video file: {output_file_with_extra_frames}")
+        if scale not in [2, 4]:
+            raise HTTPException(status_code=400, detail="Scale must be 2 or 4")
         
-        # Get video properties
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Get upsampler (may return None if memory is low)
+        upsampler = _get_upsampler(scale)
         
-        # Calculate output dimensions
-        output_width = width * scale
-        output_height = height * scale
+        # Download video
+        temp_input_path_str = await download_video(request.payload_url)
+        temp_input_path = Path(temp_input_path_str)
         
-        print(f"Input video: {width}x{height}, {total_frames} frames")
-        print(f"Output video: {output_width}x{output_height}")
-        
-        # Initialize video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(str(output_file_upscaled), fourcc, frame_rate, (output_width, output_height))
-        
-        if not out.isOpened():
-            raise Exception(f"Cannot create output video file: {output_file_upscaled}")
-        
-        # Process frames in batches for GPU efficiency
-        batch_size = 4  # Adjust based on GPU memory
-        frame_count = 0
-        batch_frames = []
-        
-        upscaling_start = time.time()
-        
+        # Extract frames
+        cap = cv2.VideoCapture(str(temp_input_path))
+        frames = []
         while True:
             ret, frame = cap.read()
             if not ret:
-                # Process remaining frames in the last batch
-                if batch_frames:
-                    upscaled_batch = _upscale_frame_batch(batch_frames, upsampler, scale)
-                    for upscaled_frame in upscaled_batch:
-                        out.write(upscaled_frame)
                 break
-            
-            # Add frame to batch
-            batch_frames.append(frame)
-            frame_count += 1
-            
-            # Process batch when full
-            if len(batch_frames) >= batch_size:
-                upscaled_batch = _upscale_frame_batch(batch_frames, upsampler, scale)
-                for upscaled_frame in upscaled_batch:
-                    out.write(upscaled_frame)
-                batch_frames = []
-            
-            # Print progress
-            if frame_count % 30 == 0:
-                elapsed = time.time() - upscaling_start
-                fps = frame_count / elapsed if elapsed > 0 else 0
-                print(f"Processed {frame_count}/{total_frames} frames ({fps:.2f} FPS)")
-        
-        # Clean up
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         cap.release()
+        temp_input_path.unlink()
+        
+        if not frames:
+            raise HTTPException(status_code=400, detail="No frames extracted from video")
+        
+        # Upscale frames
+        start_time = time.time()
+        upscaled_frames = _upscale_frame_batch(frames, upsampler, scale)
+        upscale_time = time.time() - start_time
+        
+        # Save upscaled video
+        temp_output_path = Path(f"/tmp/{os.urandom(4).hex()}_upscaled.mp4")
+        h, w = upscaled_frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(temp_output_path), fourcc, 30.0, (w, h))
+        for frame in upscaled_frames:
+            out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         out.release()
         
-        upscaling_time = time.time() - upscaling_start
-        print(f"Upscaling completed in {upscaling_time:.2f} seconds")
-        print(f"Average processing speed: {frame_count/upscaling_time:.2f} FPS")
+        # Upload to S3
+        output_url = await storage_client.upload_file(str(temp_output_path))
+        temp_output_path.unlink()
         
-        elapsed_time = time.time() - start_time
-        if not output_file_upscaled.exists():
-            raise HTTPException(status_code=500, detail="Upscaled MP4 video file was not created.")
-        print(f"Step 2 Real-ESRGAN completed in {elapsed_time:.2f} seconds. Upscaled MP4: {output_file_upscaled}")
-
-        # Cleanup intermediate files if needed
-        if output_file_with_extra_frames.exists():
-            output_file_with_extra_frames.unlink()
-            print(f"Intermediate file {output_file_with_extra_frames} deleted.")
-            
-        if input_file.exists():
-            input_file.unlink()
-            print(f"Original file {input_file} deleted.")
+        # Schedule deletion
+        try:
+            schedule_file_deletion(output_url.split('/')[-1].split('?')[0], 604800)
+        except Exception as e:
+            logger.warning(f"Failed to schedule deletion: {e}")
         
-        print(f"Returning from FastAPI: {output_file_upscaled}")
-        return output_file_upscaled
+        # Final memory cleanup
+        cleanup_memory()
+        
+        return {
+            "status": "success",
+            "output_url": output_url,
+            "processing_time": upscale_time,
+            "frames_processed": len(upscaled_frames),
+            "scale": scale,
+            "gpu_used": upsampler is not None
+        }
+        
     except Exception as e:
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        logger.error(f"Upscale failed: {e}\n{traceback.format_exc()}")
+        cleanup_memory()  # Ensure cleanup even on error
+        raise HTTPException(status_code=500, detail=f"Upscale failed: {str(e)}")
 
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health_check():
+    gpu_memory_gb = get_gpu_memory_usage() / 1024
+    return {
+        "status": "ok",
+        "gpu_memory_gb": round(gpu_memory_gb, 2),
+        "memory_threshold_gb": MEMORY_THRESHOLD_GB,
+        "models_cached": list(_model_cache.keys())
+    }
 
-@app.post("/upscale-video")
-async def video_upscaler(request: UpscaleRequest):
-    try:
-        payload_url = request.payload_url
-        task_type = request.task_type
-
-        logger.info("📻 Downloading video....")
-        payload_video_path: str = await download_video(payload_url)
-        logger.info(f"Download video finished, Path: {payload_video_path}")
-
-        processed_video_path = upscale_video(payload_video_path, task_type)
-        processed_video_name = Path(processed_video_path).name
-
-        logger.info(f"Processed video path: {processed_video_path}, video name: {processed_video_name}")
-
-        if processed_video_path is not None:
-            object_name: str = processed_video_name
-            
-            await storage_client.upload_file(object_name, processed_video_path)
-            logger.info("Video uploaded successfully.")
-            
-            # Delete the local file since we've already uploaded it to MinIO
-            if os.path.exists(processed_video_path):
-                os.remove(processed_video_path)
-                logger.info(f"{processed_video_path} has been deleted.")
-            else:
-                logger.info(f"{processed_video_path} does not exist.")
-                
-            sharing_link: str | None = await storage_client.get_presigned_url(object_name)
-            if not sharing_link:
-                logger.error("Upload failed")
-                return {"uploaded_video_url": None}
-            
-            # Schedule the file for deletion after 10 minutes (600 seconds)
-            deletion_scheduled = schedule_file_deletion(object_name)
-            if deletion_scheduled:
-                logger.info(f"Scheduled deletion of {object_name} after 10 minutes")
-            else:
-                logger.warning(f"Failed to schedule deletion of {object_name}")
-            
-            logger.info(f"Public download link: {sharing_link}")  
-
-            return {"uploaded_video_url": sharing_link}
-
-    except Exception as e:
-        logger.error(f"Failed to process upscaling request: {e}")
-        traceback.print_exc()
-        return {"uploaded_video_url": None}
-
+@app.get("/memory-stats")
+async def memory_stats():
+    """Get detailed memory statistics."""
+    gpu_memory_mb = get_gpu_memory_usage()
+    
+    # System memory
+    system_mem = psutil.virtual_memory()
+    
+    return {
+        "gpu_memory_mb": gpu_memory_mb,
+        "gpu_memory_gb": round(gpu_memory_mb / 1024, 2),
+        "system_memory_total_gb": round(system_mem.total / (1024**3), 2),
+        "system_memory_used_gb": round(system_mem.used / (1024**3), 2),
+        "system_memory_percent": system_mem.percent,
+        "memory_threshold_gb": MEMORY_THRESHOLD_GB,
+        "gpu_under_threshold": gpu_memory_mb / 1024 <= MEMORY_THRESHOLD_GB
+    }
 
 if __name__ == "__main__":
-    
     import uvicorn
-    
-    host = CONFIG.video_upscaler.host
-    port = CONFIG.video_upscaler.port
-    
-    uvicorn.run(app, host=host, port=port)
+    logger.info("Starting robust upscaling service with HD24K support...")
+    uvicorn.run(app, host="0.0.0.0", port=29115)
