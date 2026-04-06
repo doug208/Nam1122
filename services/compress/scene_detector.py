@@ -5,6 +5,10 @@ from utils.fast_scene_detect import adaptive_scene_detection_check
 from utils.split_video_into_scenes import split_video_into_scenes
 from utils.video_utils import get_keyframes
 
+# Force CPU device to prevent GPU memory consumption (23GB issue)
+# Scene classifier must run on CPU to prevent starving the upscaler
+device = 'cpu'
+
 def scene_detection(video_metadata):
     """
     Part 2: Scene detection based on video length using metadata from part 1.

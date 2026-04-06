@@ -8,6 +8,10 @@ Key Fixes:
 - Memory monitoring and self-recovery
 """
 
+import os
+# Set CUDA memory configuration before importing torch
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import sys
 sys.path.insert(0, "/workspace/Nam1122")
 sys.path.insert(0, ".")

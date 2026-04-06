@@ -129,6 +129,7 @@ class AmazonS3Client:
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name=region,
+            endpoint_url=f"https://{endpoint}" if secure else f"http://{endpoint}",
             config=BotoConfig(
                 signature_version="s3v4",
                 s3={"addressing_style": "virtual"}  # avoid path-style pitfalls
