@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import numpy as np
 import cv2
 from typing import Tuple
+import threading
 
 app = FastAPI()
 
@@ -149,10 +150,11 @@ class RealESRGANUpscaler:
             logger.info(f"Loading model weights from {model_path}...")
             load_net = torch.load(model_path, map_location=self.device)
             
-            # Remove 'params_ema' or 'params' prefix if present
-            for key in list(load_net.keys()):
-                if key.startswith('params_ema.') or key.startswith('params.'):
-                    load_net[key.replace('params_ema.', '').replace('params.', '')] = load_net.pop(key)
+            # Real-ESRGAN checkpoint stores weights as nested dict under 'params_ema' or 'params'
+            if 'params_ema' in load_net:
+                load_net = load_net['params_ema']
+            elif 'params' in load_net:
+                load_net = load_net['params']
             
             self.model.load_state_dict(load_net, strict=True)
             logger.info(f"Model weights loaded successfully from {model_path}")
@@ -403,9 +405,10 @@ def get_frame_rate(input_file: Path) -> float:
 
 def upscale_video(payload_video_path: str, task_type: str):
     """
-    Upscales a video using Real-ESRGAN Python API optimized for RTX 4090.
+    Upscales a video using Real-ESRGAN Python API optimized for RTX 4090 with streaming pipeline.
     
     Uses the globally loaded model with CUDA FP16 inference and tiled processing.
+    Frames are streamed directly from ffmpeg decoder to upscaler to ffmpeg encoder without disk I/O.
     Raises error on GPU failure - no fallback to CPU methods.
 
     Args:
@@ -438,135 +441,37 @@ def upscale_video(payload_video_path: str, task_type: str):
         frame_rate = get_frame_rate(input_file)
         logger.info(f"Frame rate detected: {frame_rate} fps")
         
-        # Generate output file paths
+        # Generate output file path
         output_file_upscaled = input_file.with_name(f"{input_file.stem}_upscaled.mp4")
-        temp_frame_dir = input_file.with_name(f"{input_file.stem}_frames")
-        temp_frame_dir.mkdir(exist_ok=True)
         
-        # Step 1: Extract frames from video
-        logger.info("Step 1: Extracting frames from video...")
+        # Create streaming pipeline: ffmpeg decode -> upscaler -> ffmpeg encode
+        logger.info("Starting streaming video upscaling pipeline...")
         start_time = time.time()
         
-        frame_pattern = str(temp_frame_dir / "frame_%08d.png")
-        extract_command = [
+        # Start ffmpeg decoding process (raw video frames to stdout)
+        decode_command = [
             "ffmpeg",
             "-i", str(input_file),
-            "-q:v", "1",  # High quality
-            frame_pattern
+            "-f", "image2pipe",
+            "-pix_fmt", "bgr24",
+            "-vcodec", "rawvideo",
+            "-"
         ]
         
-        extract_process = subprocess.run(
-            extract_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        decode_process = subprocess.Popen(
+            decode_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
         
-        if extract_process.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Frame extraction failed: {extract_process.stderr.strip()}")
-        
-        # Get list of extracted frames
-        frame_files = sorted(temp_frame_dir.glob("frame_*.png"))
-        if not frame_files:
-            raise HTTPException(status_code=500, detail="No frames extracted from video")
-        
-        logger.info(f"Extracted {len(frame_files)} frames in {time.time() - start_time:.2f} seconds")
-        
-        # Step 2: Upscale frames using Real-ESRGAN with batch processing
-        logger.info("Step 2: Upscaling frames with Real-ESRGAN (CUDA FP16, batch processing)...")
-        start_time = time.time()
-        
-        upscaled_frame_dir = input_file.with_name(f"{input_file.stem}_upscaled_frames")
-        upscaled_frame_dir.mkdir(exist_ok=True)
-        
-        # Determine optimal batch size based on frame resolution
-        # Read first frame to check resolution
-        first_frame = cv2.imread(str(frame_files[0]))
-        if first_frame is None:
-            raise RuntimeError(f"Failed to read first frame: {frame_files[0]}")
-        
-        frame_height, frame_width = first_frame.shape[:2]
-        
-        # Calculate optimal batch size based on frame size and VRAM
-        # With 24GB VRAM and FP16, we can process multiple frames
-        # Conservative estimate: ~4GB per 1080p frame in FP16 with overhead
-        frame_pixels = frame_height * frame_width
-        if frame_pixels <= 1920 * 1080:  # 1080p or smaller
-            batch_size = 4  # Process 4 frames at a time
-        elif frame_pixels <= 2560 * 1440:  # 1440p
-            batch_size = 2  # Process 2 frames at a time
-        else:  # 4K or larger
-            batch_size = 1  # Process 1 frame at a time
-        
-        logger.info(f"Using batch size {batch_size} for {frame_width}x{frame_height} frames")
-        
-        # Process frames in batches for better GPU utilization
-        total_frames = len(frame_files)
-        processed_count = 0
-        
-        for batch_start in range(0, total_frames, batch_size):
-            batch_end = min(batch_start + batch_size, total_frames)
-            batch_frame_paths = frame_files[batch_start:batch_end]
-            
-            try:
-                # Read batch of frames
-                batch_frames = []
-                for frame_path in batch_frame_paths:
-                    frame = cv2.imread(str(frame_path))
-                    if frame is None:
-                        raise RuntimeError(f"Failed to read frame: {frame_path}")
-                    batch_frames.append(frame)
-                
-                # Upscale batch
-                if len(batch_frames) == 1:
-                    # Single frame - use regular upscale
-                    upscaled_frames = [realesrgan_model.upscale(batch_frames[0])]
-                else:
-                    # Multiple frames - use batch processing
-                    upscaled_frames = realesrgan_model.upscale_batch(batch_frames, batch_size=len(batch_frames))
-                
-                # Save upscaled frames
-                for i, upscaled_frame in enumerate(upscaled_frames):
-                    frame_idx = batch_start + i
-                    
-                    # If target scale differs from model scale, resize accordingly
-                    if target_scale != realesrgan_model.scale:
-                        h, w = upscaled_frame.shape[:2]
-                        new_h = int(h * target_scale / realesrgan_model.scale)
-                        new_w = int(w * target_scale / realesrgan_model.scale)
-                        upscaled_frame = cv2.resize(upscaled_frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-                    
-                    # Save upscaled frame
-                    output_frame_path = upscaled_frame_dir / f"frame_{frame_idx+1:08d}.png"
-                    cv2.imwrite(str(output_frame_path), upscaled_frame)
-                
-                processed_count += len(batch_frames)
-                
-                # Progress logging
-                if processed_count % 20 == 0 or processed_count >= total_frames:
-                    logger.info(f"Processed {processed_count}/{total_frames} frames")
-                
-                # Explicit GPU memory management between batches
-                if batch_start % (batch_size * 4) == 0:
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                
-            except Exception as e:
-                logger.error(f"Error processing batch starting at frame {batch_start}: {e}")
-                raise RuntimeError(f"GPU upscaling failed on batch starting at frame {batch_start+1}: {e}")
-        
-        # Final GPU memory cleanup
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        
-        logger.info(f"Upscaling completed in {time.time() - start_time:.2f} seconds")
-        
-        # Step 3: Reconstruct video from upscaled frames
-        logger.info("Step 3: Reconstructing video from upscaled frames...")
-        start_time = time.time()
-        
-        upscaled_frame_pattern = str(upscaled_frame_dir / "frame_%08d.png")
+        # Start ffmpeg encoding process (raw video frames from stdin)
         encode_command = [
             "ffmpeg",
-            "-framerate", str(frame_rate),
-            "-i", upscaled_frame_pattern,
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{realesrgan_model.tile}x{realesrgan_model.tile}",
+            "-r", str(frame_rate),
+            "-i", "-",
             "-c:v", "libx265",
             "-preset", "slow",
             "-crf", "20",
@@ -580,24 +485,67 @@ def upscale_video(payload_video_path: str, task_type: str):
             str(output_file_upscaled)
         ]
         
-        encode_process = subprocess.run(
-            encode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        encode_process = subprocess.Popen(
+            encode_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
         
+        # Process frames in streaming fashion
+        frame_count = 0
+        while True:
+            # Read raw frame data from decoder
+            raw_frame_data = decode_process.stdout.read(realesrgan_model.tile * realesrgan_model.tile * 3)
+            if not raw_frame_data:
+                break
+            
+            # Convert raw data to numpy array
+            frame_array = np.frombuffer(raw_frame_data, dtype=np.uint8)
+            frame_array = frame_array.reshape((realesrgan_model.tile, realesrgan_model.tile, 3))
+            
+            # Upscale frame
+            upscaled_frame = realesrgan_model.upscale(frame_array)
+            
+            # If target scale differs from model scale, resize accordingly
+            if target_scale != realesrgan_model.scale:
+                h, w = upscaled_frame.shape[:2]
+                new_h = int(h * target_scale / realesrgan_model.scale)
+                new_w = int(w * target_scale / realesrgan_model.scale)
+                upscaled_frame = cv2.resize(upscaled_frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+            
+            # Write upscaled frame to encoder
+            encode_process.stdin.write(upscaled_frame.tobytes())
+            
+            frame_count += 1
+            
+            # Periodic GPU memory cleanup
+            if frame_count % 20 == 0:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        
+        # Close processes
+        decode_process.stdout.close()
+        decode_process.wait()
+        
+        encode_process.stdin.close()
+        encode_process.wait()
+        
+        # Check for errors
+        if decode_process.returncode != 0:
+            error_output = decode_process.stderr.read().decode()
+            raise HTTPException(status_code=500, detail=f"Frame decoding failed: {error_output}")
+        
         if encode_process.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Video encoding failed: {encode_process.stderr.strip()}")
+            error_output = encode_process.stderr.read().decode()
+            raise HTTPException(status_code=500, detail=f"Video encoding failed: {error_output}")
         
         if not output_file_upscaled.exists():
             raise HTTPException(status_code=500, detail="Upscaled video file was not created")
         
-        logger.info(f"Video encoding completed in {time.time() - start_time:.2f} seconds")
+        logger.info(f"Streaming upscaling completed in {time.time() - start_time:.2f} seconds for {frame_count} frames")
         
-        # Cleanup temporary directories
-        import shutil
-        if temp_frame_dir.exists():
-            shutil.rmtree(temp_frame_dir)
-        if upscaled_frame_dir.exists():
-            shutil.rmtree(upscaled_frame_dir)
+        # Cleanup input file
         if input_file.exists():
             input_file.unlink()
         
