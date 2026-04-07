@@ -1,3 +1,7 @@
+import sys
+sys.path.insert(0, "/workspace/Nam1122")
+sys.path.insert(0, ".")
+
 import time
 import uuid
 import traceback
@@ -12,7 +16,7 @@ from services.miner_utilities.miner_utils import video_upscaler, video_compresso
 from vidaio_subnet_core.utilities.version import check_version
 
 MAX_CONTENT_LEN = ContentLength.FIVE
-warrant_task = TaskType.UPSCALING
+warrant_task = TaskType.UPSCALING | TaskType.COMPRESSION
 
 class Miner(BaseMiner):
     def __init__(self, config: dict | None = None) -> None:

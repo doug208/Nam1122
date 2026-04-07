@@ -15,6 +15,9 @@ from utils.processing_utils import (
 from utils.encode_video import encode_video
 from utils.classify_scene import load_scene_classifier_model, CombinedModel
 
+# Module-level cache for encoding resources (scene classifier model and preprocessing pipeline)
+_encoding_resources_cache = None
+
 def get_cq_from_lookup_table(scene_type, config, target_vmaf=None, target_quality_level=None):
     """
     Look up the recommended CQ (Constant Quality) value for a scene type and target quality.
@@ -66,7 +69,9 @@ def get_cq_from_lookup_table(scene_type, config, target_vmaf=None, target_qualit
             'animation': 25,      # Cartoons compress well naturally
             'low-action': 23,     # Text/faces need moderate CQ for clarity
             'medium-action': 21,  # Balanced CQ for general content
-            'high-action': 19,    # Gaming/sports need lower CQ for quality
+            'high-action': 19,    # Gaming needs lower CQ for quality
+            'sports': 18,         # Sports: extreme motion + detail preservation
+            'nature': 20,         # Nature: complex textures need quality preservation
             'default': 22         # Safe middle-ground when unsure
         },
         # Medium quality tier (balanced CQ)
@@ -74,7 +79,9 @@ def get_cq_from_lookup_table(scene_type, config, target_vmaf=None, target_qualit
             'animation': 28,      # Cartoons compress well, can use higher CQ
             'low-action': 26,     # Text/faces need moderate CQ for clarity
             'medium-action': 24,  # Balanced CQ for general content
-            'high-action': 22,    # Gaming/sports need lower CQ for quality
+            'high-action': 22,    # Gaming needs lower CQ for quality
+            'sports': 21,         # Sports: extreme motion + detail preservation
+            'nature': 23,         # Nature: complex textures need quality preservation
             'default': 25         # Safe middle-ground when unsure
         },
         # Low quality tier (higher CQ = smaller files)
@@ -82,7 +89,9 @@ def get_cq_from_lookup_table(scene_type, config, target_vmaf=None, target_qualit
             'animation': 31,      # Cartoons compress well, can use higher CQ
             'low-action': 29,     # Text/faces need moderate CQ for clarity
             'medium-action': 27,  # Balanced CQ for general content
-            'high-action': 25,    # Gaming/sports need lower CQ for quality
+            'high-action': 25,    # Gaming needs lower CQ for quality
+            'sports': 24,         # Sports: extreme motion + detail preservation
+            'nature': 26,         # Nature: complex textures need quality preservation
             'default': 28         # Safe middle-ground when unsure
         }
     }
@@ -475,6 +484,34 @@ def load_encoding_resources(config, logging_enabled=True):
         "cq_max": cq_max                                  
     }
 
+def get_or_load_encoding_resources(config, logging_enabled=True):
+    """
+    Gets cached encoding resources or loads them from disk if not cached.
+    
+    This function implements module-level caching to avoid reloading
+    the scene classifier model and preprocessing pipeline on every request.
+    
+    Args:
+        config (dict): Configuration containing model file paths
+        logging_enabled (bool): Whether to print loading status messages
+        
+    Returns:
+        dict: Cached or freshly loaded encoding resources
+    """
+    global _encoding_resources_cache
+    
+    if _encoding_resources_cache is None:
+        if logging_enabled:
+            print(f"   📦 Loading encoding resources from disk (first time)...")
+        _encoding_resources_cache = load_encoding_resources(config, logging_enabled)
+        if logging_enabled:
+            print(f"   ✅ Encoding resources cached for reuse")
+    else:
+        if logging_enabled:
+            print(f"   📦 Using cached encoding resources")
+    
+    return _encoding_resources_cache
+
 def ai_encoding(scene_metadata, config, resources, target_vmaf=None, target_quality_level=None, logging_enabled=True):
     """
     
@@ -851,6 +888,8 @@ def map_scene_type_to_lookup_key(scene_type):
     - 'Animation / Cartoon / Rendered Graphics'
     - 'Faces / People'
     - 'Gaming Content'
+    - 'Sports Content'
+    - 'Nature / Wildlife / Documentary'
     - 'other'
     - 'unclear'
     
@@ -858,7 +897,9 @@ def map_scene_type_to_lookup_key(scene_type):
     - 'animation' (for cartoons/rendered content)
     - 'low-action' (for text/faces - less motion)
     - 'medium-action' (for general content)
-    - 'high-action' (for gaming/sports - lots of motion)
+    - 'high-action' (for gaming - lots of motion)
+    - 'sports' (for sports/athletic content - extreme motion + detail)
+    - 'nature' (for nature/documentary - complex textures)
     - 'default' (fallback for unclear content)
     
     Args:
@@ -874,13 +915,34 @@ def map_scene_type_to_lookup_key(scene_type):
         'animation / cartoon / rendered graphics': 'animation',  # Cartoons compress well
         'faces / people': 'low-action',               # Faces need clarity but less motion
         'gaming content': 'high-action',              # Games have lots of motion/detail
+        'sports content': 'sports',                   # Sports needs detail preservation
+        'nature / wildlife / documentary': 'nature',  # Nature needs texture preservation
         'other': 'medium-action',                     # General content gets medium quality
         'unclear': 'default',                        # When unsure, use safe default
         'default': 'default'
     }
     
+    # Additional mappings for specific content keywords
+    content_mappings = {
+        'sports': 'sports',
+        'athletic': 'sports',
+        'football': 'sports',
+        'basketball': 'sports',
+        'racing': 'sports',
+        'nature': 'nature',
+        'wildlife': 'nature',
+        'documentary': 'nature',
+        'landscape': 'nature',
+        'ocean': 'nature'
+    }
+    
     if scene_lower in scene_mapping:
         return scene_mapping[scene_lower]
+    
+    # Check content-specific keyword mappings
+    for keyword, mapped_type in content_mappings.items():
+        if keyword in scene_lower:
+            return mapped_type
     
     for key, value in scene_mapping.items():
         if key in scene_lower or scene_lower in key:

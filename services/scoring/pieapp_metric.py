@@ -38,10 +38,11 @@ def calculate_pieapp_score(ref_cap, proc_cap, frame_interval=1):
     print(f"Using device: {device}")
     pieapp_metric = pyiqa.create_metric('pieapp', device=device)
     
-    scores = []
+    ref_frames = []
+    proc_frames = []
     frame_idx = 0
 
-    with tqdm(total=frames_to_process, desc="Calculating PIE-APP") as pbar:
+    with tqdm(total=frames_to_process, desc="Collecting frames for PIE-APP") as pbar:
         while frame_idx < total_frames:
             # Read frames
             ref_ret, ref_frame = ref_cap.read()
@@ -60,17 +61,8 @@ def calculate_pieapp_score(ref_cap, proc_cap, frame_interval=1):
                 ref_tensor = torch.from_numpy(ref_frame_rgb).permute(2, 0, 1).float() / 255.0
                 proc_tensor = torch.from_numpy(proc_frame_rgb).permute(2, 0, 1).float() / 255.0
                 
-                # Add batch dimension
-                ref_tensor = ref_tensor.unsqueeze(0).to(device)
-                proc_tensor = proc_tensor.unsqueeze(0).to(device)
-                
-                # Calculate PIE-APP score
-                with torch.no_grad():
-                    score = pieapp_metric(proc_tensor, ref_tensor)
-                    score_value = score.item()  # Convert tensor to scalar first
-                    if score_value < 0:
-                        score_value = abs(score_value)  # Use Python's abs() on scalar
-                scores.append(score_value)
+                ref_frames.append(ref_tensor)
+                proc_frames.append(proc_tensor)
                 
                 pbar.update(1)
             
@@ -79,8 +71,21 @@ def calculate_pieapp_score(ref_cap, proc_cap, frame_interval=1):
     # Release resources
     ref_cap.release()
     proc_cap.release()
-
+    
+    if not ref_frames:
+        return 5.0
+    
+    # Stack frames into batch tensors for efficient processing
+    ref_batch = torch.stack(ref_frames).to(device)
+    proc_batch = torch.stack(proc_frames).to(device)
+    
+    # Calculate PIE-APP scores in batch
+    with torch.no_grad():
+        scores = pieapp_metric(proc_batch, ref_batch)
+        # Convert to list of scalars and ensure positive values
+        scores_list = [abs(score.item()) for score in scores]
+    
     # Return average score
-    avg_score = np.mean(scores) if scores else 5.0
+    avg_score = np.mean(scores_list) if scores_list else 5.0
     
     return min(avg_score, 2.0) 

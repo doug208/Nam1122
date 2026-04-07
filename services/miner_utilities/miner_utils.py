@@ -33,7 +33,8 @@ async def download_video(video_url: str) -> Path:
         logger.info(f"Downloading video from {video_url} to {output_path}")
         start_time = time.time()
         # Download the file using aiohttp
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=600)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(video_url) as response:
                 if response.status != 200:
                     raise Exception(f"Failed to download video. HTTP status: {response.status}")
@@ -74,7 +75,8 @@ async def video_upscaler(payload_url: str, task_type: str) -> str | None:
         "task_type": task_type,
     }
     
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=600)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, headers=headers, data=json.dumps(data)) as response:
             if response.status == 200:
                 result = await response.json()
@@ -113,7 +115,8 @@ async def video_compressor(payload_url: str, vmaf_threshold: float, target_codec
         "target_bitrate": target_bitrate,
     }
     logger.info(f"🎬 Sending compression request: VMAF={vmaf_threshold}, Codec={target_codec}, Mode={codec_mode}, Bitrate={target_bitrate} Mbps")
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=600)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, headers=headers, data=json.dumps(data)) as response:
             if response.status == 200:
                 result = await response.json()

@@ -150,12 +150,35 @@ class OrganicsCompressionScoringResponse(BaseModel):
     reasons: List[str]
 
 # Load pre-trained model for feature extraction
+
+# Module-level cache for quality model
+_quality_model_cache = None
+
 def load_quality_model():
     """Load ResNet50 model for quality assessment"""
     from torchvision.models import ResNet50_Weights
     model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
     model.eval()
     return model
+
+def get_or_load_quality_model():
+    """
+    Gets cached quality model or loads it from disk if not cached.
+    
+    This function implements module-level caching to avoid reloading
+    the ResNet50 model on every request.
+    
+    Returns:
+        torch.nn.Module: Cached or freshly loaded ResNet50 model
+    """
+    global _quality_model_cache
+    
+    if _quality_model_cache is None:
+        logger.info("Loading quality model from disk (first time)...")
+        _quality_model_cache = load_quality_model()
+        logger.info("Quality model cached for reuse")
+    
+    return _quality_model_cache
 
 _shared_session: Optional[aiohttp.ClientSession] = None
 
@@ -870,7 +893,7 @@ def validate_chroma_quality_ffmpeg(ref_stats, dist_stats, threshold=0.7):
 def calculate_clipiqa_plus_score(frames):
     """Calculate ClipIQA+ inspired score for given frames"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = load_quality_model().to(device)
+    model = get_or_load_quality_model().to(device)
     
     # Preprocessing pipeline
     preprocess = transforms.Compose([
@@ -3177,6 +3200,17 @@ async def score_organics_compression(request: OrganicsCompressionScoringRequest)
         final_scores=final_scores,
         reasons=reasons
     )
+
+@app.on_event("startup")
+async def startup_event():
+    """Pre-load quality model at startup to eliminate first-request overhead."""
+    logger.info("Pre-loading quality assessment model (ResNet50)...")
+    try:
+        get_or_load_quality_model()
+        logger.info("Quality model pre-loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to pre-load quality model: {e}")
+        logger.warning("Server will continue starting, but first request may be slow")
 
 if __name__ == "__main__":
     import uvicorn

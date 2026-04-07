@@ -1,3 +1,4 @@
+import urllib3
 from minio import Minio
 import os
 import asyncio
@@ -481,29 +482,64 @@ class HippiusClient:
         self.executor = ThreadPoolExecutor()
         
         # Placeholder for the actual client implementation
+        # Create custom HTTP client with proper timeout and retry settings
+        http_client = urllib3.PoolManager(
+            timeout=urllib3.Timeout(connect=15.0, read=120.0),
+            retries=urllib3.Retry(
+                total=5,
+                backoff_factor=1.0,
+                status_forcelist=[500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "PUT", "POST", "DELETE", "OPTIONS"]
+            ),
+            maxsize=10
+        )
+        
+        # Initialize Minio client with custom HTTP client
         self.client = Minio(
             endpoint,
             access_key=self.access_key,
             secret_key=self.secret_key,
             secure=self.secure,
+            region=self.region,
+            http_client=http_client
         )
 
     async def upload_file(self, object_name, file_path):
         """
-        Upload a file to Hippius storage.
-        
-        Args:
-            object_name (str): Name to give the object in storage
-            file_path (str): Path to the file to upload
-            
-        Returns:
-            dict: Information about the uploaded object, including etag and version_id
+        Upload a file to Hippius storage using single-part upload to avoid
+        multipart upload issues with Hippius S3 backend (files > 5MB fail
+        with RemoteDisconnected during multipart initiation).
         """
+        import io
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            self.executor, self.client.fput_object, self.bucket_name, object_name, file_path
-        )
-        return {"etag": result.etag, "version_id": result.version_id}
+        max_retries = 3
+        last_exception = None
+
+        def _do_upload():
+            with open(file_path, 'rb') as f:
+                data = f.read()
+            file_size = len(data)
+            result = self.client.put_object(
+                self.bucket_name,
+                object_name,
+                io.BytesIO(data),
+                length=file_size,
+                part_size=max(file_size, 5 * 1024 * 1024)  # force single-part upload
+            )
+            return result
+
+        for attempt in range(max_retries):
+            try:
+                result = await loop.run_in_executor(self.executor, _do_upload)
+                return {"etag": result.etag, "version_id": result.version_id}
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    import asyncio as aio
+                    await aio.sleep(wait_time)
+                else:
+                    raise last_exception
 
     async def download_file(self, object_name, file_path):
         """

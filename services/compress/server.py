@@ -18,7 +18,7 @@ from loguru import logger
 
 from video_preprocessor import pre_processing
 from scene_detector import scene_detection
-from encoder import ai_encoding, load_encoding_resources
+from encoder import ai_encoding, get_or_load_encoding_resources
 from vmaf_calculator import scene_vmaf_calculation
 from validator_merger import validation_and_merging
 from vidaio_subnet_core.utilities import storage_client, download_video
@@ -682,7 +682,7 @@ def _execute_ai_encoding(scenes_metadata: list, config: dict, target_quality: st
     print(f"   🔧 Loading AI models and resources...")
     
     try:
-        resources = load_encoding_resources(config, logging_enabled=True)
+        resources = get_or_load_encoding_resources(config, logging_enabled=True)
         print(f"   ✅ AI resources loaded successfully")
         print(f"   🧠 Mode: Scene classification + CQ lookup table")
     except Exception as e:
@@ -961,6 +961,27 @@ def _display_pipeline_summary(input_file: str, final_video_path: str, part1_resu
     
     print(f"\n   🎉 Pipeline completed successfully!")
     print(f"   🚀 Ready for playback: {final_video_path}")
+
+
+# ============================================================================
+# Startup Event - Preload AI Models
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Pre-load encoding resources at startup to eliminate first-request overhead."""
+    logger.info("Pre-loading encoding resources (scene classifier model and preprocessing pipeline)...")
+    try:
+        # Load configuration
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        config = _load_configuration(current_dir)
+        
+        # Preload resources
+        get_or_load_encoding_resources(config, logging_enabled=True)
+        logger.info("Encoding resources pre-loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to pre-load encoding resources: {e}")
+        logger.warning("Server will continue starting, but first request may be slow")
 
 
 # ============================================================================
